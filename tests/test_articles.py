@@ -65,7 +65,7 @@ def test_collector_is_bounded_deduplicates_and_isolates_failures(factory):
 
     def handler(request):
         seen.append(str(request.url))
-        if "openai.com" in str(request.url):
+        if request.url.host == "openai.com":
             return httpx.Response(503)
         return httpx.Response(200, content=rss)
 
