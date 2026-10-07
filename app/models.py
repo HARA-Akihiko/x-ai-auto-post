@@ -103,6 +103,7 @@ class PostDraft(Base):
     status: Mapped[DraftStatus] = mapped_column(enum_type(DraftStatus), default=DraftStatus.PENDING)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     publishing_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    reconcile_attempts: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
     error_code: Mapped[str | None] = mapped_column(String(64))
 
 

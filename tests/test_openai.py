@@ -78,3 +78,43 @@ def test_web_search_is_explicit_opt_in():
             event("response.output_text.delta", delta="Search result")
             + event("response.completed", response={"status": "completed"})))
     assert complete(handler, web_search=True) == "Search result"
+
+
+@pytest.mark.parametrize("status,code,retryable", [
+    (401, "responses_unauthorized", False),
+    (403, "responses_forbidden", False),
+    (429, "chatgpt_usage_limit", True),
+    (500, "responses_api_error", True),
+    (503, "responses_api_error", True),
+    (400, "responses_api_error", False),
+])
+def test_typed_status_errors(status, code, retryable):
+    calls = []
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(status, text="sensitive-error-body")
+    with pytest.raises(ServiceError) as caught:
+        complete(handler)
+    assert caught.value.error_code == code
+    assert caught.value.retryable is retryable
+    assert "sensitive-error-body" not in str(caught.value)
+    assert len(calls) == 1
+
+
+def test_end_to_end_timeout_stops_trickled_heartbeats(monkeypatch):
+    monkeypatch.setattr(ResponsesClient, "TOTAL_TIMEOUT_SECONDS", 0.02)
+    class HeartbeatStream(httpx.AsyncByteStream):
+        closed = False
+        async def __aiter__(self):
+            while True:
+                await asyncio.sleep(0.001)
+                yield b": heartbeat\n\n"
+        async def aclose(self):
+            self.closed = True
+    stream = HeartbeatStream()
+    with pytest.raises(ServiceError) as caught:
+        complete(lambda request: httpx.Response(
+            200, headers={"content-type": "text/event-stream"}, stream=stream))
+    assert caught.value.error_code == "responses_transport_error"
+    assert caught.value.retryable
+    assert stream.closed

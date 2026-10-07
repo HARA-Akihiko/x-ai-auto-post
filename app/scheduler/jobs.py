@@ -1,9 +1,12 @@
 import asyncio
 import hashlib
+import json
+import logging
 from contextlib import asynccontextmanager
 
 from sqlalchemy import select, text
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import object_session
 
 from app.models import (
     DraftSource, DraftStatus, JobRun, JobStatus, PostDraft, PublishedPost, utcnow,
@@ -15,6 +18,8 @@ from app.services.posts import post_hash, validate_post
 
 _test_locks = {}
 PUBLISHER_LOCK = 723816352
+MAX_RECONCILE_ATTEMPTS = 3
+logger = logging.getLogger(__name__)
 
 
 def _slot_key(slot):
@@ -87,30 +92,67 @@ def _finish(job, status, error_code=None):
     job.status = status
     job.error_code = error_code
     job.finished_at = utcnow()
+    job.duration = 0
     started = job.started_at
     if started is not None:
         if started.tzinfo is None:
             started = started.replace(tzinfo=job.finished_at.tzinfo)
         job.duration = max(0, int((job.finished_at - started).total_seconds()))
+    session = object_session(job)
+    article_id = None
+    if session is not None and job.draft_id is not None:
+        article_id = session.scalar(select(DraftSource.article_id).where(
+            DraftSource.draft_id == job.draft_id,
+        ).limit(1))
+    record = {
+        "event": "job_completed", "job_run_id": job.id, "slot": job.slot,
+        "article_id": article_id, "draft_id": job.draft_id,
+        "status": status.value, "duration": job.duration, "error_code": error_code,
+    }
+    if session is not None:
+        session.info.setdefault("posting_completion_logs", []).append(record)
+    else:
+        logger.info(json.dumps(record, ensure_ascii=False))
 
 
-async def _generate(slot, settings, session_factory, collector, analyzer, generator, lease):
+def _commit(session):
+    try:
+        session.commit()
+    except Exception:
+        session.info.pop("posting_completion_logs", None)
+        raise
+    for record in session.info.pop("posting_completion_logs", []):
+        logger.info(json.dumps(record, ensure_ascii=False))
+
+
+async def _generate(
+    slot, settings, session_factory, collector, analyzer, generator, lease, *, preview_only=False,
+):
     with session_factory() as session:
         existing = session.scalar(select(PostDraft).where(PostDraft.slot == slot))
         if existing is not None:
             return existing
+        if session.scalar(select(PostDraft.id).where(
+            PostDraft.status == DraftStatus.PUBLISHING,
+        ).limit(1)) is not None:
+            return None
         job = _job(session, slot)
         if job.status in {JobStatus.SUCCESS, JobStatus.SKIPPED, JobStatus.FAILED, JobStatus.UNCERTAIN}:
             return None
         job.status = JobStatus.RUNNING
+        job.error_code = "preview_generation" if preview_only else None
         job.started_at = job.started_at or utcnow()
-        session.commit()
+        _commit(session)
         try:
             await collector.collect(session)
-            article = await analyzer.analyze(candidates(session, settings))
+            available = candidates(session, settings)
+            if not available and getattr(settings, "web_search_enabled", False):
+                await collector.search_fallback(session, analyzer.responses_client)
+                available = candidates(session, settings)
+            article = await analyzer.analyze(available)
             if article is None:
                 _finish(job, JobStatus.SKIPPED)
-                session.commit()
+                _commit(session)
                 return None
             text_value = await generator.generate(article)
             validate_post(text_value)
@@ -124,7 +166,9 @@ async def _generate(slot, settings, session_factory, collector, analyzer, genera
                 session.add(DraftSource(draft_id=draft.id, article_id=article.id))
                 job.draft_id = draft.id
                 session.flush()
-            session.commit()
+            if preview_only:
+                _finish(job, JobStatus.SUCCESS)
+            _commit(session)
             session.refresh(draft)
             session.expunge(draft)
             return draft
@@ -132,24 +176,26 @@ async def _generate(slot, settings, session_factory, collector, analyzer, genera
             session.rollback()
             job = _job(session, slot)
             _finish(job, JobStatus.SKIPPED, "duplicate_post")
-            session.commit()
+            _commit(session)
             return None
         except Exception as exc:
             session.rollback()
             job = _job(session, slot)
             _finish(job, JobStatus.FAILED, getattr(exc, "error_code", "generation_failed"))
-            session.commit()
+            _commit(session)
             return None
 
 
 def _uncertain(session_factory, draft_id, code):
     with session_factory() as session:
         draft = session.get(PostDraft, draft_id)
+        if draft.reconcile_attempts >= MAX_RECONCILE_ATTEMPTS:
+            code = "publish_manual_review"
         draft.error_code = code
         job = _job(session, draft.slot)
         job.draft_id = draft.id
         _finish(job, JobStatus.UNCERTAIN, code)
-        session.commit()
+        _commit(session)
 
 
 def _record_success(session_factory, draft_id, x_id):
@@ -166,7 +212,7 @@ def _record_success(session_factory, draft_id, x_id):
         job = _job(session, draft.slot)
         job.draft_id = draft.id
         _finish(job, JobStatus.SUCCESS)
-        session.commit()
+        _commit(session)
 
 
 async def _publish(draft_id, settings, session_factory, x_service, lease):
@@ -175,7 +221,20 @@ async def _publish(draft_id, settings, session_factory, x_service, lease):
         if draft is None or draft.status in {DraftStatus.PUBLISHED, DraftStatus.FAILED, DraftStatus.CANCELLED}:
             return
         was_publishing = draft.status == DraftStatus.PUBLISHING
-        if not was_publishing:
+        if was_publishing:
+            if draft.reconcile_attempts >= MAX_RECONCILE_ATTEMPTS:
+                if draft.error_code != "publish_manual_review":
+                    draft.error_code = "publish_manual_review"
+                    job = _job(session, draft.slot)
+                    job.draft_id = draft.id
+                    _finish(job, JobStatus.UNCERTAIN, draft.error_code)
+                    _commit(session)
+                return
+            # Persist the budget before any external GET, including failures
+            # and process interruptions, so restarting cannot reset the limit.
+            draft.reconcile_attempts += 1
+            _commit(session)
+        else:
             try:
                 validate_post(draft.text)
                 lease.check()
@@ -183,7 +242,7 @@ async def _publish(draft_id, settings, session_factory, x_service, lease):
                 draft.status = DraftStatus.FAILED
                 draft.error_code = getattr(exc, "error_code", "invalid_post")
                 _finish(_job(session, draft.slot), JobStatus.FAILED, draft.error_code)
-                session.commit()
+                _commit(session)
                 return
             # A generated draft must not claim an article already sent or in flight.
             article_ids = select(DraftSource.article_id).where(DraftSource.draft_id == draft.id)
@@ -196,7 +255,7 @@ async def _publish(draft_id, settings, session_factory, x_service, lease):
             if conflict is not None:
                 draft.status = DraftStatus.CANCELLED
                 _finish(_job(session, draft.slot), JobStatus.SKIPPED, "duplicate_article")
-                session.commit()
+                _commit(session)
                 return
             draft.status = DraftStatus.PUBLISHING
             draft.publishing_at = utcnow()
@@ -205,7 +264,7 @@ async def _publish(draft_id, settings, session_factory, x_service, lease):
             job.status = JobStatus.UNCERTAIN
             job.started_at = job.started_at or utcnow()
             job.error_code = "publish_in_flight"
-            session.commit()
+            _commit(session)
         text_value, publishing_at = draft.text, draft.publishing_at
     if was_publishing:
         try:
@@ -223,13 +282,13 @@ async def _publish(draft_id, settings, session_factory, x_service, lease):
             x_id = await x_service.publish(text_value)
         except Exception as exc:
             code = getattr(exc, "error_code", "x_publish_uncertain")
-            if code == "x_rejected":
+            if code in {"x_rejected", "x_unauthorized", "x_rate_limited"}:
                 with session_factory() as session:
                     draft = session.get(PostDraft, draft_id)
                     draft.status = DraftStatus.FAILED
                     draft.error_code = code
                     _finish(_job(session, draft.slot), JobStatus.FAILED, code)
-                    session.commit()
+                    _commit(session)
             else:
                 _uncertain(session_factory, draft_id, code)
             return
@@ -243,7 +302,17 @@ async def generate_draft(slot, settings, session_factory, collector, analyzer, g
     async with _locks(session_factory, slot) as lease:
         if lease is None:
             return None
-        return await _generate(slot, settings, session_factory, collector, analyzer, generator, lease)
+        draft = await _generate(
+            slot, settings, session_factory, collector, analyzer, generator, lease, preview_only=True,
+        )
+        if draft is not None and draft.status == DraftStatus.GENERATED:
+            with session_factory() as session:
+                job = _job(session, slot)
+                if job.status != JobStatus.SUCCESS or job.draft_id != draft.id:
+                    job.draft_id = draft.id
+                    _finish(job, JobStatus.SUCCESS)
+                    _commit(session)
+        return draft
 
 
 async def publish_draft(draft_id, settings, session_factory, x_service):

@@ -183,7 +183,8 @@ def create_app(settings=None, session_factory=None, http_client=None) -> FastAPI
     @application.get("/posts", dependencies=protected)
     def posts(request: Request, limit: int = 50):
         with request.app.state.factory() as session:
-            return [serialize(row, ("id", "slot", "text", "status", "created_at", "error_code"))
+            return [serialize(row, ("id", "slot", "text", "status", "created_at",
+                                    "reconcile_attempts", "error_code"))
                     for row in session.scalars(select(PostDraft).order_by(PostDraft.id.desc())
                                                .limit(max(1, min(limit, 100))))]
 

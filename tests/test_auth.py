@@ -25,6 +25,7 @@ def settings():
         admin_api_token="a" * 32,
         chatgpt_client_id="registered-client",
         chatgpt_host_id="registered-host",
+        chatgpt_resource="https://api.openai.com/v1",
         chatgpt_model="configured-model",
         x_client_id="registered-x",
     )
@@ -67,6 +68,7 @@ def test_pkce_encryption_and_replay(settings, factory):
     state = params["state"][0]
     assert params["code_challenge_method"] == ["S256"]
     assert params["ext_agent_host_id"] == ["registered-host"]
+    assert params["resource"] == ["https://api.openai.com/v1"]
     assert "host_id" not in params
     with factory() as session:
         stored = session.get(OAuthState, hashlib.sha256(state.encode()).hexdigest())
@@ -164,10 +166,12 @@ def test_binding_and_scope_checked_on_every_use(settings, factory):
         data = parse_qs(request.content.decode())
         assert data["client_id"] == ["registered-client"]
         assert data["ext_agent_host_id"] == ["registered-host"]
+        assert data["resource"] == ["https://api.openai.com/v1"]
         return httpx.Response(200, json={**token_payload(), "ext_agent_host_id": "bound-host"})
     auth = service(settings, factory, handler)
     state = state_for(auth)
     settings.chatgpt_client_id = "changed-client"
+    settings.chatgpt_resource = "https://api.example/changed"
     run(auth.callback("chatgpt", state, "code"))
     assert auth.status("chatgpt")["client_id"] == "registered-client"
     assert auth.status("chatgpt")["host_id"] == "bound-host"
@@ -208,6 +212,7 @@ def test_expired_x_refresh_rotation(settings, factory):
         calls.append(data)
         assert data["client_id"] == ["registered-x"]
         assert "ext_agent_host_id" not in data and "host_id" not in data
+        assert "resource" not in data
         return httpx.Response(200, json={
             "access_token": "x-new-access" if len(calls) > 1 else "x-access",
             "refresh_token": "x-rotated-refresh" if len(calls) > 1 else "x-refresh",
@@ -232,6 +237,7 @@ def test_refresh_preserves_bound_host_and_rotates_metadata(settings, factory):
         data = parse_qs(request.content.decode())
         calls.append(data)
         assert data["client_id"] == ["registered-client"]
+        assert data["resource"] == ["https://api.openai.com/v1"]
         assert data["ext_agent_host_id"] == [
             "registered-host" if len(calls) == 1 else "bound-host"]
         return httpx.Response(200, json={

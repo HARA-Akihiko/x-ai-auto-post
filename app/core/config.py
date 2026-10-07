@@ -29,10 +29,11 @@ class Settings(BaseSettings):
     web_search_enabled: bool = False
     chatgpt_client_id: str = ""
     chatgpt_client_secret: SecretStr = SecretStr("")
-    chatgpt_authorize_url: str = "https://auth.openai.com/api/accounts/authorize"
-    chatgpt_token_url: str = "https://auth.openai.com/api/accounts/oauth/token"
+    chatgpt_authorize_url: str = "https://auth.openai.com/oauth/authorize"
+    chatgpt_token_url: str = "https://auth.openai.com/oauth/token"
     chatgpt_redirect_uri: str = "http://localhost:8000/auth/chatgpt/callback"
-    chatgpt_scope: str = "openid offline_access chatgpt.tokens.use.direct"
+    chatgpt_scope: str = "openid offline_access resource.invoke chatgpt.tokens.use.direct"
+    chatgpt_resource: str = "https://api.openai.com/v1"
     chatgpt_host_id: str = ""
     chatgpt_model: str = ""
     responses_url: str = "https://api.openai.com/v1/responses"
@@ -63,7 +64,7 @@ class Settings(BaseSettings):
         ZoneInfo(value)
         return value
 
-    @field_validator("chatgpt_authorize_url", "chatgpt_token_url", "responses_url",
+    @field_validator("chatgpt_authorize_url", "chatgpt_token_url", "chatgpt_resource", "responses_url",
                      "x_authorize_url", "x_token_url", "x_api_url")
     @classmethod
     def secure_endpoint(cls, value: str) -> str:

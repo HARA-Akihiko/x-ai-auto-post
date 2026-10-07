@@ -27,6 +27,11 @@ Codex client ID、ブラウザ cookie、非公開 `backend-api` は使用しま�
 直接取得は DNS エラーだったため、preview の登録条件、許可モデル一覧、
 固定の token lifetime、self-hosted の認可条件はライブ検証できていません。
 導入時には以下を確認し、設定を最新の登録情報に合わせてください。
+OAuth endpoint の既定値は OpenAI の公式ソース
+（[authorization](https://github.com/openai/codex/blob/main/codex-rs/login/src/server.rs) /
+[token](https://github.com/openai/codex/blob/main/codex-rs/login/src/auth/manager.rs)）
+でも確認しました。登録先の
+`https://auth.openai.com/.well-known/openid-configuration` の情報を優先してください。
 
 - [Sign in with ChatGPT](https://developers.openai.com/siwc)
 - [Token sharing overview](https://developers.openai.com/siwc/token-sharing-open-source)
@@ -37,7 +42,9 @@ Codex client ID、ブラウザ cookie、非公開 `backend-api` は使用しま�
 - [X OAuth 2.0 / PKCE](https://docs.x.com/fundamentals/authentication/oauth-2-0/authorization-code)
 - [X character counting](https://docs.x.com/fundamentals/counting-characters)
 
-ChatGPT の inference scope は `chatgpt.tokens.use.direct`、長期更新には
+ChatGPT の inference scope は `resource.invoke chatgpt.tokens.use.direct`、
+resource audience は `CHATGPT_RESOURCE`（既定 `https://api.openai.com/v1`）、
+長期更新には
 `offline_access` を要求します。X は `tweet.read tweet.write users.read
 offline.access` を要求します。X アプリに投稿・ユーザー情報・直近投稿取得の
 権限と利用枠が必要です。両プロバイダで PKCE S256 と期限付き一回限りの state
@@ -117,6 +124,8 @@ callback は一回限りの state で検証します。X と ChatGPT の両方�
 を使用します。OS timezone に依存しません。`POST /jobs/run-now` は
 `{"idempotency_key":"operator-request-001"}` のような body を要求します。
 同じキーを再送しても新しい Job は作成しません。
+Worker は最大 5 分前までの未実行 slot を拾います。長時間停止中の投稿を
+再起動時にまとめて送信することはありません。
 切断はローカル削除です。プロバイダ側での許可取消はアカウント設定で行ってください。
 
 ## 収集・AI 利用量
@@ -142,6 +151,7 @@ RSS 候補が足りない場合にのみ使用し、通常の RSS 収集で毎�
 AI の事実誤認を完全に防ぐことはできないため、運用前に Draft を確認してください。
 
 `URL_POLICY` は `ALWAYS` / `IMPORTANT_ONLY` / `NONE`。
+`IMPORTANT_ONLY` は AI 判定の重要度が 10 点中 8 点以上の場合に URL を添えます。
 標準 X 投稿の上限は weighted 280、HTTP(S) URL は 23 units として検証します。
 複合 emoji は安全側に過大計数する場合があり、上限内の文を拒否する可能性があります。
 自動切り捨てで意味を変更したり、検証失敗文をそのまま送信したりしません。
@@ -160,6 +170,10 @@ timeout・通信断・結果不明時は `publishing` を保持し、直近投�
 「失敗した」と断定して自動再 POST はしません。
 再起動後も同じ Draft は照合専用です。この安全性のため、未送信の投稿が
 保留される場合があります。X 側を確認してから運用者が手動で対処してください。
+自動照合は DB に回数を保存して最大 3 回までです。上限後は
+`publish_manual_review` として保留し、X API を毎分無限に呼び続けません。
+X の投稿履歴と権限を確認し、Worker を停止した状態で運用者が
+Draft / Job の状態を修復してください。照合失敗だけを根拠に再送しないでください。
 
 自動無限 retry はありません。401 は再認証、429 は枠・rate limit の確認、
 5xx / network は次回処理の判断が必要です。投稿 POST の結果不明は一般的な

@@ -1,3 +1,4 @@
+import asyncio
 import json
 
 import httpx
@@ -9,6 +10,7 @@ class ResponsesClient:
     MAX_EVENT_BYTES = 65536
     MAX_STREAM_BYTES = 1048576
     MAX_TEXT_LENGTH = 32768
+    TOTAL_TIMEOUT_SECONDS = 90
     TIMEOUT = httpx.Timeout(60.0, connect=10.0)
 
     def __init__(self, settings, auth_service, http_client):
@@ -25,19 +27,25 @@ class ResponsesClient:
         if web_search:
             payload["tools"] = [{"type": "web_search"}]
         try:
-            async with self.http_client.stream(
-                "POST", self.settings.responses_url,
-                headers={"Authorization": "Bearer " + access, "Accept": "text/event-stream"},
-                json=payload,
-                timeout=self.TIMEOUT, follow_redirects=False,
-            ) as response:
-                if response.status_code != 200:
-                    raise ServiceError("responses_api_error",
-                                       response.status_code == 429 or response.status_code >= 500)
-                if "text/event-stream" not in response.headers.get("content-type", "").lower():
-                    raise ServiceError("responses_invalid")
-                return await self._read(response)
-        except httpx.RequestError:
+            async with asyncio.timeout(self.TOTAL_TIMEOUT_SECONDS):
+                async with self.http_client.stream(
+                    "POST", self.settings.responses_url,
+                    headers={"Authorization": "Bearer " + access, "Accept": "text/event-stream"},
+                    json=payload,
+                    timeout=self.TIMEOUT, follow_redirects=False,
+                ) as response:
+                    if response.status_code == 401:
+                        raise ServiceError("responses_unauthorized")
+                    if response.status_code == 403:
+                        raise ServiceError("responses_forbidden")
+                    if response.status_code == 429:
+                        raise ServiceError("chatgpt_usage_limit", retryable=True)
+                    if response.status_code != 200:
+                        raise ServiceError("responses_api_error", response.status_code >= 500)
+                    if "text/event-stream" not in response.headers.get("content-type", "").lower():
+                        raise ServiceError("responses_invalid")
+                    return await self._read(response)
+        except (httpx.RequestError, TimeoutError):
             raise ServiceError("responses_transport_error", retryable=True) from None
 
     async def _read(self, response):

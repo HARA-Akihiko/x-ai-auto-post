@@ -128,6 +128,22 @@ def test_x_validation_before_post_and_permanent_rejection():
     assert len(requests) == 1
 
 
+@pytest.mark.parametrize("status,code,retryable", [
+    (401, "x_unauthorized", False), (429, "x_rate_limited", True),
+])
+def test_explicit_x_auth_and_rate_limit_errors_are_distinct(status, code, retryable):
+    async def run():
+        auth = SimpleNamespace(access_token=AsyncMock(return_value="test-token"))
+        async with httpx.AsyncClient(transport=httpx.MockTransport(
+            lambda request: httpx.Response(status)
+        )) as client:
+            with pytest.raises(ServiceError) as caught:
+                await XPostService(settings(), auth, client).publish("valid")
+            assert caught.value.error_code == code
+            assert caught.value.retryable is retryable
+    asyncio.run(run())
+
+
 def test_reconcile_paginates_and_expands_urls_exactly():
     requests = []
 
@@ -199,14 +215,84 @@ def test_timeout_restarts_only_reconcile_never_post_again(factory):
         assert session.scalar(select(PublishedPost)).x_post_id == "321"
 
 
-def test_rejection_is_failed_not_uncertain(factory):
+def test_reconciliation_budget_is_persisted_before_get_and_exhaustion_blocks_jobs(factory):
+    identifier = seed(factory, status=DraftStatus.PUBLISHING)
+    observed = []
+
+    async def reconcile(value, started):
+        with factory() as session:
+            observed.append(session.get(PostDraft, identifier).reconcile_attempts)
+        return None
+
+    service = SimpleNamespace(publish=AsyncMock(), reconcile=AsyncMock(side_effect=reconcile))
+    collector = SimpleNamespace(collect=AsyncMock())
+    analyzer = SimpleNamespace(analyze=AsyncMock())
+    generator = SimpleNamespace(generate=AsyncMock())
+
+    async def run():
+        for _ in range(6):
+            await jobs.publish_draft(identifier, settings(), factory, service)
+        await jobs.publish_post_job(
+            "manual:blocked", settings(), factory, collector, analyzer, generator, service,
+        )
+    asyncio.run(run())
+    assert observed == [1, 2, 3]
+    assert service.reconcile.await_count == 3
+    service.publish.assert_not_awaited()
+    collector.collect.assert_not_awaited()
+    analyzer.analyze.assert_not_awaited()
+    generator.generate.assert_not_awaited()
+    with factory() as session:
+        draft = session.get(PostDraft, identifier)
+        assert draft.status == DraftStatus.PUBLISHING
+        assert draft.reconcile_attempts == 3
+        assert draft.error_code == "publish_manual_review"
+        job = session.scalar(select(JobRun))
+        assert job.status == JobStatus.UNCERTAIN
+        assert job.error_code == "publish_manual_review"
+
+
+def test_reconcile_transport_failures_also_consume_persistent_budget(factory):
+    identifier = seed(factory, status=DraftStatus.PUBLISHING)
+    attempted = []
+
+    def handler(request):
+        assert request.method == "GET"
+        with factory() as session:
+            attempted.append(session.get(PostDraft, identifier).reconcile_attempts)
+        raise httpx.ReadTimeout("timeout", request=request)
+
+    async def run():
+        auth = SimpleNamespace(access_token=AsyncMock(return_value="test-token"))
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            service = XPostService(settings(), auth, client)
+            for _ in range(6):
+                await jobs.publish_draft(identifier, settings(), factory, service)
+    asyncio.run(run())
+    assert attempted == [1, 2, 3]
+    with factory() as session:
+        draft = session.get(PostDraft, identifier)
+        assert draft.status == DraftStatus.PUBLISHING
+        assert draft.error_code == "publish_manual_review"
+
+
+@pytest.mark.parametrize("code,retryable", [
+    ("x_rejected", False), ("x_unauthorized", False), ("x_rate_limited", True),
+])
+def test_rejection_is_failed_not_uncertain(factory, code, retryable):
     identifier = seed(factory)
-    service = SimpleNamespace(publish=AsyncMock(side_effect=ServiceError("x_rejected")),
+    service = SimpleNamespace(publish=AsyncMock(side_effect=ServiceError(code, retryable=retryable)),
                               reconcile=AsyncMock())
     asyncio.run(jobs.publish_draft(identifier, settings(), factory, service))
+    asyncio.run(jobs.publish_draft(identifier, settings(), factory, service))
+    service.publish.assert_awaited_once()
+    service.reconcile.assert_not_awaited()
     with factory() as session:
         assert session.get(PostDraft, identifier).status == DraftStatus.FAILED
-        assert session.scalar(select(JobRun)).status == JobStatus.FAILED
+        assert session.get(PostDraft, identifier).error_code == code
+        job = session.scalar(select(JobRun))
+        assert job.status == JobStatus.FAILED
+        assert job.error_code == code
 
 
 def test_db_failure_after_success_leaves_durable_publishing(factory, monkeypatch):
@@ -240,10 +326,23 @@ def test_uncertain_reconciled_before_any_collection_or_ai(factory):
     service.publish.assert_not_awaited()
 
 
+def test_standalone_generation_waits_for_uncertain_publication(factory):
+    seed(factory, status=DraftStatus.PUBLISHING)
+    collector = SimpleNamespace(collect=AsyncMock())
+    analyzer = SimpleNamespace(analyze=AsyncMock())
+    generator = SimpleNamespace(generate=AsyncMock())
+    assert asyncio.run(jobs.generate_draft(
+        "generated:new", settings(), factory, collector, analyzer, generator,
+    )) is None
+    collector.collect.assert_not_awaited()
+    analyzer.analyze.assert_not_awaited()
+    generator.generate.assert_not_awaited()
+
+
 def test_central_job_generates_links_and_publishes_once(factory):
     with factory() as session:
         row = Article(
-            title="AI model release", summary="Inference improvements", source_name="OpenAI",
+            title="AI model release", summary="SDK inference improvements", source_name="OpenAI",
             canonical_url="https://example.com/a", url="https://example.com/a",
             content_hash=hashlib.sha256(b"article").hexdigest(), score=50, published_at=utcnow(),
         )
@@ -327,7 +426,7 @@ def test_duplicate_hash_uses_savepoint_without_aborting_job(factory):
     seed(factory)
     with factory() as session:
         row = Article(
-            title="AI model release", summary="Inference", source_name="OpenAI",
+            title="AI model release", summary="SDK inference", source_name="OpenAI",
             canonical_url="https://example.com/a", url="https://example.com/a",
             content_hash="b" * 64, published_at=utcnow(),
         )
@@ -345,6 +444,65 @@ def test_duplicate_hash_uses_savepoint_without_aborting_job(factory):
         assert len(session.scalars(select(PostDraft)).all()) == 1
 
 
+def test_standalone_generation_is_completed_not_left_for_auto_publish(factory):
+    from app.scheduler.worker import worker_tick
+
+    with factory() as session:
+        session.add(Article(
+            title="AI model release", summary="SDK inference", source_name="OpenAI",
+            canonical_url="https://example.com/a", url="https://example.com/a",
+            content_hash="c" * 64, published_at=utcnow(),
+        ))
+        session.commit()
+    collector = SimpleNamespace(collect=AsyncMock(return_value=[]))
+    analyzer = SimpleNamespace(analyze=AsyncMock(side_effect=lambda rows: rows[0]))
+    generator = SimpleNamespace(generate=AsyncMock(return_value="推論の改善を検証"))
+    draft = asyncio.run(jobs.generate_draft(
+        "generated:request", settings(), factory, collector, analyzer, generator,
+    ))
+    assert draft.status == DraftStatus.GENERATED
+    with factory() as session:
+        run = session.scalar(select(JobRun).where(JobRun.slot == draft.slot))
+        assert run.status == JobStatus.SUCCESS
+        assert run.draft_id == draft.id
+    service = SimpleNamespace(publish=AsyncMock(), reconcile=AsyncMock())
+    asyncio.run(worker_tick(
+        utcnow(), settings(), factory, collector, analyzer, generator, service,
+    ))
+    service.publish.assert_not_awaited()
+    assert collector.collect.await_count == 1
+    assert generator.generate.await_count == 1
+
+
+def test_interrupted_preview_cannot_be_resumed_as_a_publish_job(factory):
+    from app.scheduler.worker import worker_tick
+
+    with factory() as session:
+        session.add(Article(
+            title="AI model release", summary="SDK inference", source_name="OpenAI",
+            canonical_url="https://example.com/a", url="https://example.com/a",
+            content_hash="d" * 64, published_at=utcnow(),
+        ))
+        session.commit()
+    collector = SimpleNamespace(collect=AsyncMock(return_value=[]))
+    analyzer = SimpleNamespace(analyze=AsyncMock(side_effect=lambda rows: rows[0]))
+    generator = SimpleNamespace(generate=AsyncMock(side_effect=asyncio.CancelledError()))
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(jobs.generate_draft(
+            "arbitrary-preview-slot", settings(), factory, collector, analyzer, generator,
+        ))
+    with factory() as session:
+        run = session.scalar(select(JobRun))
+        assert run.status == JobStatus.RUNNING
+        assert run.error_code == "preview_generation"
+    service = SimpleNamespace(publish=AsyncMock(), reconcile=AsyncMock())
+    asyncio.run(worker_tick(
+        utcnow(), settings(), factory, collector, analyzer, generator, service,
+    ))
+    service.publish.assert_not_awaited()
+    assert collector.collect.await_count == 1
+
+
 def test_invalid_generated_text_never_reaches_x(factory):
     identifier = seed(factory)
     with factory() as session:
@@ -355,6 +513,43 @@ def test_invalid_generated_text_never_reaches_x(factory):
     service.publish.assert_not_awaited()
     with factory() as session:
         assert session.get(PostDraft, identifier).status == DraftStatus.FAILED
+
+
+def test_completion_logs_are_structured_and_contain_no_external_content(factory, caplog):
+    identifier = seed(factory)
+    service = SimpleNamespace(
+        publish=AsyncMock(side_effect=RuntimeError("SECRET external response")),
+        reconcile=AsyncMock(),
+    )
+    with caplog.at_level("INFO", logger="app.scheduler.jobs"):
+        asyncio.run(jobs.publish_draft(identifier, settings(), factory, service))
+    messages = [record.message for record in caplog.records if record.name == "app.scheduler.jobs"]
+    assert len(messages) == 1
+    record = json.loads(messages[0])
+    assert set(record) == {
+        "event", "job_run_id", "slot", "article_id", "draft_id", "status", "duration", "error_code",
+    }
+    assert record["event"] == "job_completed"
+    assert record["draft_id"] == identifier
+    assert record["job_run_id"] is not None
+    assert record["status"] == "uncertain"
+    assert record["error_code"] == "x_publish_uncertain"
+    assert "SECRET" not in caplog.text
+    assert "生成AIの実用的な変更" not in caplog.text
+
+
+def test_completion_is_not_logged_when_persistence_commit_fails(factory, caplog, monkeypatch):
+    with factory() as session:
+        job = JobRun(slot="log:test", status=JobStatus.RUNNING, started_at=utcnow())
+        session.add(job)
+        session.flush()
+        with caplog.at_level("INFO", logger="app.scheduler.jobs"):
+            jobs._finish(job, JobStatus.SUCCESS)
+            assert not caplog.records
+            monkeypatch.setattr(session, "commit", lambda: (_ for _ in ()).throw(RuntimeError("db failed")))
+            with pytest.raises(RuntimeError):
+                jobs._commit(session)
+            assert not caplog.records
 
 
 @pytest.mark.integration
@@ -409,12 +604,14 @@ def test_postgres_durable_uncertainty_in_isolated_schema():
             auth = SimpleNamespace(access_token=AsyncMock(return_value="test-token"))
             async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
                 service = XPostService(settings(), auth, client)
-                await jobs.publish_draft(identifier, settings(), factory, service)
-                await jobs.publish_draft(identifier, settings(), factory, service)
+                for _ in range(6):
+                    await jobs.publish_draft(identifier, settings(), factory, service)
         asyncio.run(run())
         assert len(posted) == 1
         with factory() as session:
             assert session.get(PostDraft, identifier).status == DraftStatus.PUBLISHING
+            assert session.get(PostDraft, identifier).reconcile_attempts == 3
+            assert session.get(PostDraft, identifier).error_code == "publish_manual_review"
             assert session.scalar(select(JobRun)).status == JobStatus.UNCERTAIN
     finally:
         with engine.begin() as connection:

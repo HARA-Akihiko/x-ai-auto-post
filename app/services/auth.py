@@ -58,6 +58,8 @@ class OAuthService:
             raise ServiceError("oauth_not_configured")
         if provider == "chatgpt" and self.DIRECT_SCOPE not in scope.split():
             raise ServiceError("oauth_scope_missing")
+        if provider == "chatgpt" and not self.settings.chatgpt_resource.strip():
+            raise ServiceError("oauth_not_configured")
         return client, host, scope
 
     def _lock(self, session, provider):
@@ -98,7 +100,8 @@ class OAuthService:
         verifier = secrets.token_urlsafe(64)
         challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
         context = {"verifier": verifier, "client_id": client, "host_id": host,
-                   "redirect_uri": getattr(self.settings, f"{provider}_redirect_uri")}
+                   "redirect_uri": getattr(self.settings, f"{provider}_redirect_uri"),
+                   "resource": self.settings.chatgpt_resource if provider == "chatgpt" else ""}
         with self.session_factory.begin() as session:
             self._lock(session, provider)
             session.execute(delete(OAuthState).where(OAuthState.provider == provider))
@@ -113,6 +116,8 @@ class OAuthService:
                       code_challenge_method="S256")
         if host:
             params["ext_agent_host_id"] = host
+        if provider == "chatgpt":
+            params["resource"] = context["resource"]
         url = getattr(self.settings, f"{provider}_authorize_url")
         return url + ("&" if "?" in url else "?") + urlencode(params)
 
@@ -198,13 +203,15 @@ class OAuthService:
                 context = json.loads(self._decrypt(stored.verifier))
                 if (not isinstance(context, dict)
                         or any(not isinstance(context.get(key), str)
-                               for key in ("client_id", "verifier", "host_id", "redirect_uri"))):
+                               for key in ("client_id", "verifier", "host_id", "redirect_uri", "resource"))):
                     raise ServiceError("oauth_state_invalid")
                 data = dict(grant_type="authorization_code", code=code,
                             client_id=context["client_id"], code_verifier=context["verifier"],
                             redirect_uri=context["redirect_uri"])
                 if context["host_id"]:
                     data["ext_agent_host_id"] = context["host_id"]
+                if provider == "chatgpt":
+                    data["resource"] = context["resource"]
                 payload = await self._request_token(provider, data)
                 self._save(row, provider, payload, context["client_id"], context["host_id"])
             except (ServiceError, asyncio.CancelledError) as exc:
@@ -248,6 +255,10 @@ class OAuthService:
                         client_id=row.client_id)
             if row.host_id:
                 data["ext_agent_host_id"] = row.host_id
+            if provider == "chatgpt":
+                if not self.settings.chatgpt_resource.strip():
+                    raise ServiceError("oauth_not_configured")
+                data["resource"] = self.settings.chatgpt_resource
             payload = await self._request_token(provider, data)
             self._save(row, provider, payload, row.client_id, row.host_id, refreshing=True)
             return self._decrypt(row.access_token)

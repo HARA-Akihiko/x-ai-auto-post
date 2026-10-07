@@ -16,6 +16,8 @@ def test_safe_defaults_and_bounded_ai_usage():
     assert value.timezone == "Asia/Tokyo"
     assert value.post_times == "08:00,13:00,19:00"
     assert value.candidate_limit == 3
+    assert value.chatgpt_authorize_url == "https://auth.openai.com/oauth/authorize"
+    assert value.chatgpt_token_url == "https://auth.openai.com/oauth/token"
     assert "TOKEN" not in repr(value.admin_api_token)
 
 

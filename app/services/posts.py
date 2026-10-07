@@ -142,6 +142,10 @@ class XPostService:
             )
         except httpx.HTTPError as exc:
             raise ServiceError("x_publish_uncertain", retryable=True) from exc
+        if response.status_code == 401:
+            raise ServiceError("x_unauthorized")
+        if response.status_code == 429:
+            raise ServiceError("x_rate_limited", retryable=True)
         if 400 <= response.status_code < 500 and response.status_code != 408:
             raise ServiceError("x_rejected")
         if not 200 <= response.status_code < 300:

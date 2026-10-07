@@ -3,6 +3,7 @@ import hashlib
 import json
 from datetime import timedelta
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -27,7 +28,7 @@ def factory():
 def article(index=1, **values):
     fields = dict(
         canonical_url=f"https://example.com/{index}", url=f"https://example.com/{index}",
-        title=f"New AI model {index}", source_name="OpenAI", summary="Useful AI inference",
+        title=f"New AI model {index}", source_name="OpenAI", summary="Useful AI inference SDK",
         content_hash=hashlib.sha256(str(index).encode()).hexdigest(), published_at=utcnow(), score=index,
     )
     fields.update(values)
@@ -113,6 +114,23 @@ def test_candidates_are_recent_relevant_bounded_and_not_inflight(factory):
         assert [row.canonical_url for row in rows] == ["https://example.com/6", "https://example.com/5"]
 
 
+def test_general_ai_news_excluded_but_developer_themes_are_relevant(factory):
+    with factory() as session:
+        session.add_all([
+            article(1, title="AI model creates paintings", summary="Diffusion art is beautiful", score=999),
+            article(2, title="ClaudeCode developer release", summary="Coding tools", score=50),
+            article(3, title="Codex CLI update", summary="Developer workflow", score=40),
+            article(4, title="MCP context tools", summary="Agentic IDE integrations", score=30),
+            article(5, title="AI Copilot", summary="GitHub API and token context", score=20),
+        ])
+        session.commit()
+        selected = candidates(session, SimpleNamespace(article_max_age_days=7, candidate_limit=5))
+        assert [row.canonical_url for row in selected] == [
+            "https://example.com/2", "https://example.com/3",
+            "https://example.com/4", "https://example.com/5",
+        ]
+
+
 class Responses:
     def __init__(self, value):
         self.value = value
@@ -141,3 +159,40 @@ def test_analyzer_validates_ids_scores_and_skips_low_value():
             asyncio.run(ArticleAnalyzer(Responses(json.dumps({"rankings": bad}))).analyze(rows))
     assert asyncio.run(ArticleAnalyzer(Responses(json.dumps({"rankings": [ranks[1]]}))).analyze([rows[1]])) is None
     assert asyncio.run(ArticleAnalyzer(client).analyze([])) is None
+
+
+def test_search_fallback_is_explicit_optin_bounded_and_official_only(factory):
+    with factory() as session:
+        session.add(Source(name="OpenAI", url="https://openai.com/news/rss.xml", priority=50))
+        session.commit()
+    entry = {
+        "url": "https://openai.com/index/new-model?utm_source=search",
+        "title": "AI model improvements", "summary": "Useful SDK inference improvements",
+        "source": "OpenAI", "published_at": (utcnow() - timedelta(minutes=1)).isoformat(),
+    }
+    client = SimpleNamespace(complete=AsyncMock(return_value=json.dumps({"articles": [entry]})))
+    settings = SimpleNamespace(web_search_enabled=False, article_max_age_days=7)
+    collector = ArticleCollector(settings, None)
+
+    async def run():
+        with factory() as session:
+            assert await collector.search_fallback(session, client) == []
+            client.complete.assert_not_awaited()
+            settings.web_search_enabled = True
+            rows = await collector.search_fallback(session, client)
+            assert len(rows) == 1
+            assert rows[0].canonical_url == "https://openai.com/index/new-model"
+            assert client.complete.call_args.kwargs == {"web_search": True}
+            assert await collector.search_fallback(session, client) == []
+            for replacement in (
+                {"url": "https://attacker.example/ai"},
+                {"published_at": (utcnow() + timedelta(days=1)).isoformat()},
+                {"source": "Unknown"}, {"title": "x" * 501},
+            ):
+                client.complete.return_value = json.dumps({"articles": [dict(entry, **replacement)]})
+                assert await collector.search_fallback(session, client) == []
+            client.complete.side_effect = ServiceError("responses_forbidden")
+            assert await collector.search_fallback(session, client) == []
+    asyncio.run(run())
+    with factory() as session:
+        assert len(session.scalars(select(Article)).all()) == 1
