@@ -49,6 +49,11 @@ class CredentialMixin:
 
 class ChatGPTCredential(CredentialMixin, Base):
     __tablename__ = "chatgpt_credentials"
+    # Identity verified from the ID token at sign-in. NULL marks a credential saved by the
+    # pre-token-sharing browser flow, which must not be used.
+    subject: Mapped[str | None] = mapped_column(String(255))
+    email: Mapped[str | None] = mapped_column(String(320))
+    issuer: Mapped[str | None] = mapped_column(String(255))
 
 
 class XCredential(CredentialMixin, Base):

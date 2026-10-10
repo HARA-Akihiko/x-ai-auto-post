@@ -39,11 +39,20 @@ def test_migration_roundtrip_preserves_drafts_and_initial_feeds(monkeypatch):
                 "INSERT INTO post_drafts (slot,text,status,created_at) "
                 "VALUES ('existing-slot','draft','generated',CURRENT_TIMESTAMP)"
             ))
+            connection.execute(text(
+                "INSERT INTO chatgpt_credentials "
+                "(id,access_token,expires_at,scope,client_id,host_id) "
+                "VALUES (1,'encrypted-legacy',CURRENT_TIMESTAMP,'openid','pre-registered','host')"
+            ))
         command.upgrade(config, "head")
         with engine.connect() as connection:
             assert connection.scalar(text(
                 "SELECT reconcile_attempts FROM post_drafts WHERE slot='existing-slot'"
             )) == 0
+            # Credentials from the old browser flow stay, marked legacy by a NULL subject.
+            assert tuple(connection.execute(text(
+                "SELECT access_token, subject, email, issuer FROM chatgpt_credentials"
+            )).one()) == ("encrypted-legacy", None, None, None)
         command.downgrade(config, "0e7b81141fb1")
         command.upgrade(config, "head")
         command.check(config)
