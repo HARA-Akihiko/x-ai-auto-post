@@ -14,6 +14,7 @@ from sqlalchemy.orm import sessionmaker
 
 from app.core.config import CHATGPT_ISSUER, CHATGPT_RESOURCE, CHATGPT_TOKEN_URL, Settings
 from app.models import Base, ChatGPTCredential, OAuthState, XCredential, utcnow
+from app.services import auth as auth_module
 from app.services.auth import OAuthService, ServiceError
 
 HOST_ID = "urn:uuid:123e4567-e89b-42d3-a456-426614174000"
@@ -408,6 +409,104 @@ def test_invalid_refresh_response_keeps_previous_tokens(settings, factory, chang
         assert decrypt(settings, session.get(ChatGPTCredential, 1).refresh_token) == "refresh-secret"
 
 
+def test_refresh_starts_before_access_token_expiry(settings, factory, monkeypatch):
+    # Refresh early so a token cannot expire during a Responses stream (up to 90 seconds).
+    now = utcnow()
+    monkeypatch.setattr(auth_module, "utcnow", lambda: now)
+    calls = []
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(200, json=chatgpt_refresh_payload())
+    auth = service(settings, factory, handler)
+    auth.import_chatgpt(exported_record())
+    margin = OAuthService.REFRESH_MARGIN
+    with factory.begin() as session:
+        session.get(ChatGPTCredential, 1).expires_at = now + margin + timedelta(seconds=1)
+    assert run(auth.access_token("chatgpt")) == "access-secret"
+    assert calls == []
+    with factory.begin() as session:
+        session.get(ChatGPTCredential, 1).expires_at = now + margin
+    assert run(auth.access_token("chatgpt")) == "new-access"
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("body", [
+    {"error": "invalid_grant"}, {"error": "invalid_refresh_token"}, {"error": "token_expired"},
+    {"error": "refresh_token_expired"}, {"error": "refresh_token_invalidated"},
+    {"error": "refresh_token_reused"}, {"error": {"code": "refresh_token_reused"}},
+])
+def test_unusable_refresh_token_is_cleared_but_registration_is_kept(settings, factory, body):
+    auth = service(settings, factory, lambda request: httpx.Response(400, json=body))
+    auth.import_chatgpt(exported_record())
+    expire(factory)
+    with pytest.raises(ServiceError) as caught:
+        run(auth.access_token("chatgpt"))
+    assert caught.value.error_code == "oauth_reauthorization_required"
+    assert not caught.value.retryable
+    with factory() as session:
+        row = session.get(ChatGPTCredential, 1)
+        assert (row.access_token, row.refresh_token, row.id_token) == ("", None, None)
+        assert (row.client_id, row.subject, row.host_id) == (ISSUED_CLIENT_ID, "user-subject", HOST_ID)
+    assert auth.status("chatgpt")["connected"] is False
+
+
+@pytest.mark.parametrize("response,error,retryable", [
+    (httpx.Response(401, json={"error": "invalid_client"}), "oauth_client_invalid", False),
+    (httpx.Response(400, json={"error": "invalid_request"}), "oauth_authorization_failed", False),
+    (httpx.Response(400, text="not-json"), "oauth_authorization_failed", False),
+    (httpx.Response(503), "oauth_endpoint_error", True),
+    (httpx.Response(429), "oauth_endpoint_error", True),
+])
+def test_other_refresh_failures_keep_tokens(settings, factory, response, error, retryable):
+    auth = service(settings, factory, lambda request: response)
+    auth.import_chatgpt(exported_record())
+    expire(factory)
+    with pytest.raises(ServiceError) as caught:
+        run(auth.access_token("chatgpt"))
+    assert (caught.value.error_code, caught.value.retryable) == (error, retryable)
+    with factory() as session:
+        assert decrypt(settings, session.get(ChatGPTCredential, 1).refresh_token) == "refresh-secret"
+
+
+def test_x_refresh_rejection_behavior_is_unchanged(settings, factory):
+    responses = [httpx.Response(200, json=x_token_payload()),
+                 httpx.Response(400, json={"error": "invalid_grant"})]
+    auth = service(settings, factory, lambda request: responses.pop(0))
+    run(auth.callback("x", state_for(auth), "code"))
+    expire(factory, XCredential)
+    with pytest.raises(ServiceError, match="oauth_authorization_failed"):
+        run(auth.access_token("x"))
+    with factory() as session:
+        assert decrypt(settings, session.get(XCredential, 1).refresh_token) == "x-refresh-secret"
+
+
+def test_cancelled_refresh_still_stores_rotated_refresh_token(settings, factory):
+    async def scenario():
+        started, release = asyncio.Event(), asyncio.Event()
+        async def handler(request):
+            started.set()
+            await release.wait()
+            return httpx.Response(200, json=chatgpt_refresh_payload())
+        auth = service(settings, factory, handler)
+        auth.import_chatgpt(exported_record())
+        expire(factory)
+        refreshing = asyncio.create_task(auth.access_token("chatgpt"))
+        await started.wait()
+        refreshing.cancel()
+        await asyncio.sleep(0)
+        refreshing.cancel()
+        await asyncio.sleep(0.01)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await refreshing
+        with factory() as session:
+            row = session.get(ChatGPTCredential, 1)
+            # OpenAI already rotated the refresh token, so losing it would force re-authorization.
+            assert decrypt(settings, row.refresh_token) == "rotated-refresh"
+            assert decrypt(settings, row.access_token) == "new-access"
+    run(scenario())
+
+
 # --- PostgreSQL ----------------------------------------------------------------
 
 @pytest.mark.integration
@@ -462,3 +561,82 @@ def test_postgres_serializes_concurrent_refresh(settings):
         with engine.begin() as connection:
             connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
         engine.dispose()
+
+
+@pytest.fixture
+def postgres_factory():
+    if not os.getenv("TEST_DATABASE_URL"):
+        pytest.skip("TEST_DATABASE_URL unavailable")
+    engine = create_engine(os.environ["TEST_DATABASE_URL"])
+    schema = "oauth_test_" + uuid.uuid4().hex
+    with engine.begin() as connection:
+        connection.execute(text(f'CREATE SCHEMA "{schema}"'))
+    scoped = engine.execution_options(schema_translate_map={None: schema})
+    try:
+        Base.metadata.create_all(scoped)
+        yield sessionmaker(scoped, expire_on_commit=False)
+    finally:
+        with engine.begin() as connection:
+            connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
+        engine.dispose()
+
+
+def hold_row_lock(factory):
+    """Lock the ChatGPT credential row from another connection, like a concurrent refresher."""
+    session = factory()
+    session.scalars(select(ChatGPTCredential).with_for_update()).one()
+    return session
+
+
+@pytest.mark.integration
+def test_postgres_valid_token_is_read_without_waiting_for_refresh_lock(settings, postgres_factory):
+    auth = service(settings, postgres_factory, lambda request: pytest.fail("must not refresh"))
+    auth.import_chatgpt(exported_record())
+    holder = hold_row_lock(postgres_factory)
+    try:
+        assert run(asyncio.wait_for(auth.access_token("chatgpt"), timeout=2)) == "access-secret"
+    finally:
+        holder.rollback()
+        holder.close()
+
+
+@pytest.mark.integration
+def test_postgres_refresh_lock_wait_is_bounded(settings, postgres_factory, monkeypatch):
+    monkeypatch.setattr(OAuthService, "LOCK_WAIT_SECONDS", 0.3)
+    auth = service(settings, postgres_factory, lambda request: pytest.fail("must not refresh"))
+    auth.import_chatgpt(exported_record())
+    expire(postgres_factory)
+    holder = hold_row_lock(postgres_factory)
+    try:
+        with pytest.raises(ServiceError) as caught:
+            run(asyncio.wait_for(auth.access_token("chatgpt"), timeout=5))
+        assert caught.value.error_code == "oauth_refresh_busy" and caught.value.retryable
+    finally:
+        holder.rollback()
+        holder.close()
+
+
+@pytest.mark.integration
+def test_postgres_cancelled_lock_wait_leaves_no_lock_behind(settings, postgres_factory):
+    async def handler(request):
+        return httpx.Response(200, json=chatgpt_refresh_payload())
+    auth = service(settings, postgres_factory, handler)
+    auth.import_chatgpt(exported_record())
+    expire(postgres_factory)
+    holder = hold_row_lock(postgres_factory)
+    async def scenario():
+        waiting = asyncio.create_task(auth.access_token("chatgpt"))
+        await asyncio.sleep(0.2)
+        waiting.cancel()
+        await asyncio.sleep(0)
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+        holder.rollback()
+        holder.close()
+        # Nothing from the cancelled waiter may still hold the row.
+        return await asyncio.wait_for(auth.access_token("chatgpt"), timeout=5)
+    try:
+        assert run(scenario()) == "new-access"
+    finally:
+        holder.close()

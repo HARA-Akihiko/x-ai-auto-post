@@ -63,8 +63,10 @@ ChatGPT プランを使えない場合に、従量課金 API Key へ自動フォ
 5. credential を `~/.config/x-ai-auto-post/chatgpt-credentials.json`（権限 `0600`）に保存します。
 6. サーバーで `import` すると、token を Fernet で暗号化して PostgreSQL に保存します。host ID は、
    サーバー自身の `CHATGPT_HOST_ID` を使います。
-7. 以後の refresh はサーバーが行います。refresh では issued client ID・refresh token・resource
-   だけを送り、返された新しい refresh token に置き換えます（rotation）。
+7. 以後の refresh はサーバーが行います。access token の期限の5分前になると、issued client ID・
+   refresh token・resource だけを送って refresh し、返された新しい refresh token に置き換えます
+   （rotation）。API と Worker から同時に呼ばれても、PostgreSQL の行ロックで refresh を1回に
+   まとめます。refresh の応答を受け取った後は、処理がキャンセルされても新しい token を保存します。
 
 サーバーは ID token を推論の権限判定に使いません。アカウントの識別子（`sub`）は、CLI で検証した
 値を保存します。import するファイルは、運用者が自分の PC から SSH などで渡す入力として信頼し、
@@ -174,8 +176,10 @@ docker compose run --rm api python -m app.cli.chatgpt smoke
 
 ### 再認証・切断
 
-- token が使えなくなったら、同じ PC で `login` を再実行してから `import` します。保存済みの
-  issued client ID が再利用されます。
+- refresh token が使えなくなった場合（`invalid_grant`、`refresh_token_reused` など）、サーバーは
+  token を消去して `oauth_reauthorization_required` を返します。同じ PC で `login` を再実行して
+  から `import` します。保存済みの issued client ID が再利用されます。一時的な通信障害や 5xx では
+  token を消去しません。
 - `DELETE /auth/chatgpt` は、サーバーの token を消去します（client ID と host ID は残します）。
   OpenAI 側での接続解除は、ChatGPT の Settings で行ってください。
 - PC 側で別のアカウントを新規登録するときは、`~/.config/x-ai-auto-post/chatgpt-credentials.json`
