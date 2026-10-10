@@ -20,6 +20,7 @@ class ServiceError(Exception):
     def __init__(self, error_code: str, retryable: bool = False):
         self.error_code = error_code
         self.retryable = retryable
+        self.request_id: str | None = None
         super().__init__(error_code)
 
 
