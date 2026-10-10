@@ -17,45 +17,66 @@ httpx。API と投稿 Worker は**別プロセス**です。API の lifespan は
 
 ## 認証仕様と前提
 
-**ChatGPT Plus の契約だけで、すべてのモデル・API・アプリに無条件にアクセス
-できるわけではありません。** OpenAI が認める Sign in with ChatGPT の
-token-sharing 登録、利用者の明示的な同意、利用可能なモデルが必要です。
-登録済み `CHATGPT_CLIENT_ID`、安定した `CHATGPT_HOST_ID`、登録に合致する
-redirect URI、利用可能な `CHATGPT_MODEL` を指定してください。他アプリの
-Codex client ID、ブラウザ cookie、非公開 `backend-api` は使用しません。
-利用できない場合に従量課金 API Key へ自動フォールバックすることもありません。
+ChatGPT は OpenAI の **Sign in with ChatGPT の token sharing（オープンソースアプリ向け、preview）**
+で接続します。OpenAI API Key、client secret、事前登録の client ID は使いません。初回の
+Sign in で client が動的に登録され、発行された client ID（issued client ID）を保存して以後も
+使います。他アプリの Codex client ID、ブラウザ cookie、非公開 `backend-api` は使用しません。
+ChatGPT プランを使えない場合に、従量課金 API Key へ自動フォールバックすることもありません。
 
-2026-10-07 に公式資料を検索経由で確認しました。この実行環境から公式サイトの
-直接取得は DNS エラーだったため、preview の登録条件、許可モデル一覧、
-固定の token lifetime、self-hosted の認可条件はライブ検証できていません。
-導入時には以下を確認し、設定を最新の登録情報に合わせてください。
-OAuth endpoint の既定値は OpenAI の公式ソース
-（[authorization](https://github.com/openai/codex/blob/main/codex-rs/login/src/server.rs) /
-[token](https://github.com/openai/codex/blob/main/codex-rs/login/src/auth/manager.rs)）
-でも確認しました。登録先の
-`https://auth.openai.com/.well-known/openid-configuration` の情報を優先してください。
+- Sign in 時に、利用者が ChatGPT プランの利用（`chatgpt.tokens.use.direct`）に同意する必要が
+  あります。この scope が付与されていなければ推論しません。
+- ChatGPT Plus の5時間利用上限は、ChatGPT プランを使う全アプリで共有されます。利用状況、
+  アプリ別の上限、接続解除は ChatGPT の Settings → Usage で確認できます。
+- 公式文書の対象は、オープンソースでローカル／セルフホストのアプリです。第三者向けに有償または
+  リモートで提供する場合は、OpenAI の interest form からの申請が必要です。
+- preview のため仕様が変わる可能性があります。導入前に以下の公式資料を確認してください。
 
-- [Sign in with ChatGPT](https://developers.openai.com/siwc)
+2026-10-11 に、以下の公式資料と
+`https://auth.openai.com/.well-known/openid-configuration` を直接取得して確認しました。
+
 - [Token sharing overview](https://developers.openai.com/siwc/token-sharing-open-source)
 - [Registration and sign-in](https://developers.openai.com/siwc/token-sharing-open-source/sign-in)
+- [Accounts and sessions](https://developers.openai.com/siwc/token-sharing-open-source/profiles-and-sessions)
 - [Models and inference](https://developers.openai.com/siwc/token-sharing-open-source/models-and-inference)
 - [Self-hosted VMs](https://developers.openai.com/siwc/token-sharing-open-source/self-hosted-vms)
+- [Token reference](https://developers.openai.com/siwc/token-sharing-open-source/token-reference)
+- [Errors and recovery](https://developers.openai.com/siwc/token-sharing-open-source/errors-and-recovery)
 - [Preview limitations](https://developers.openai.com/siwc/token-sharing-open-source/preview-limitations)
 - [X OAuth 2.0 / PKCE](https://docs.x.com/fundamentals/authentication/oauth-2-0/authorization-code)
 - [X character counting](https://docs.x.com/fundamentals/counting-characters)
 
-ChatGPT の inference scope は `resource.invoke chatgpt.tokens.use.direct`、
-resource audience は `CHATGPT_RESOURCE`（既定 `https://api.openai.com/v1`）、
-長期更新には
-`offline_access` を要求します。X は `tweet.read tweet.write users.read
-offline.access` を要求します。X アプリに投稿・ユーザー情報・直近投稿取得の
-権限と利用枠が必要です。両プロバイダで PKCE S256 と期限付き一回限りの state
-を使用します。`id_token` は暗号化保存する opaque 値で、検証せずにユーザー
-認証・権限判定には使用しません。本アプリは単一所有者・単一接続アカウント用です。
+### ChatGPT の認証フロー
+
+`127.0.0.1` の loopback callback は、ブラウザを開いた PC にしか届きません。そのため Sign in は
+ブラウザのある PC で CLI（`python -m app.cli.chatgpt login`）として実行し、取得した credential
+を API / Worker が動くサーバー（ローカルの Compose またはセルフホスト VM）へ取り込みます。
+
+1. CLI が、この PC 用の `ext_agent_host_id`（`urn:uuid:…`）を初回だけ生成して保存します。
+2. 初回は `client_id=dynamic_agent_client` と `agent_name_hint=x-ai-auto-post` で認可します。
+   再認証では、保存済みの issued client ID を使います。scope は
+   `openid profile email offline_access resource.invoke chatgpt.tokens.use.direct`、
+   resource は `https://api.openai.com/v1` です。
+3. callback（`http://127.0.0.1:<port>/auth/callback`）で state を照合し、callback で返された
+   issued client ID と PKCE S256 で code を交換します。
+4. ID token を OpenAI の JWKS で署名検証し、`iss`・`aud`（issued client ID）・`exp`・`nonce`・
+   `sub` を確認します。付与 scope に `chatgpt.tokens.use.direct` がなければ保存しません。
+5. credential を `~/.config/x-ai-auto-post/chatgpt-credentials.json`（権限 `0600`）に保存します。
+6. サーバーで `import` すると、token を Fernet で暗号化して PostgreSQL に保存します。host ID は、
+   サーバー自身の `CHATGPT_HOST_ID` を使います。
+7. 以後の refresh はサーバーが行います。refresh では issued client ID・refresh token・resource
+   だけを送り、返された新しい refresh token に置き換えます（rotation）。
+
+サーバーは ID token を推論の権限判定に使いません。アカウントの識別子（`sub`）は、CLI で検証した
+値を保存します。import するファイルは、運用者が自分の PC から SSH などで渡す入力として信頼し、
+ID token の再検証はしません。
+
+X は `tweet.read tweet.write users.read offline.access` を要求し、FastAPI の login / callback、
+PKCE S256、期限付き一回限りの state で接続します。X アプリには、投稿・ユーザー情報・直近投稿取得の
+権限と利用枠が必要です。本アプリは単一所有者・単一接続アカウント用です。
 
 Responses は OAuth access token を使い、`stream=true`、`store=false` で
 呼び出します。token 期限は固定せず token response の `expires_in` を使用します。
-access / refresh / id token と PKCE verifier は Fernet で暗号化保存し、
+access / refresh / id token と X の PKCE verifier は Fernet で暗号化保存し、
 PostgreSQL 行ロック下で refresh・rotation を保存します。
 
 ## 起動
@@ -71,7 +92,7 @@ uv run python -c 'import secrets; print(secrets.token_urlsafe(32))'
 `.env` はコミットしないでください。`DATABASE_URL` には PostgreSQL 接続 URL
 を指定します。Compose では host を `db` とし、`POSTGRES_PASSWORD` と一致する
 パスワードを URL に URL エンコードして含めてください。
-ChatGPT/X の OAuth 設定と許可モデルを入力してから起動します。
+X の OAuth 設定、`CHATGPT_HOST_ID`、`CHATGPT_MODEL` を入力してから起動します。
 
 ```bash
 docker compose up --build -d
@@ -79,7 +100,7 @@ docker compose up --build -d
 
 Compose は DB の ready → Alembic → API / Worker の順で起動します。
 API はホストの `127.0.0.1:8000` のみに公開します。外部公開する場合は HTTPS
-reverse proxy とプロバイダ登録済み HTTPS callback を設定してください。
+reverse proxy と、X に登録済みの HTTPS callback を設定してください。
 DB をインターネットに公開しないでください。
 
 ローカル開発では PostgreSQL を起動したうえで、別ターミナルで実行します。
@@ -95,19 +116,100 @@ reverse proxy でも callback query と Authorization header を記録しない�
 暗号化キーは DB と別に保管・バックアップしてください。キー紛失時は再認証が必要です。
 管理トークンを URL query に渡さないでください。
 
+## ChatGPT の Sign in と取り込み
+
+まず、サーバー側の `.env` に、サーバー自身の host ID と利用するモデルを設定します。
+
+```bash
+python3 -c 'import uuid; print("urn:uuid:" + str(uuid.uuid4()))'   # CHATGPT_HOST_ID に設定
+```
+
+`CHATGPT_MODEL` は、下記の smoke test が表示する、接続アカウントで使えるモデルから選びます。
+
+### 1. ブラウザのある PC で Sign in する
+
+このリポジトリを PC に取得して `uv sync --frozen` を実行してから、次を実行します。
+
+```bash
+uv run python -m app.cli.chatgpt login
+```
+
+ブラウザで ChatGPT にサインインし、agent 名を確認して ChatGPT プランの利用を許可します。
+
+- `127.0.0.1:1455` が使用中なら、`--port <番号>` で変更できます（変えられるのはポートだけです）。
+- ChatGPT プランの利用を許可しなかった場合は、`--consent` を付けて再実行します。
+- DB や暗号鍵は不要です。端末に token は表示しません。
+
+### 2. サーバーへ取り込む
+
+ローカルの Docker Compose の場合:
+
+```bash
+docker compose run --rm -T api python -m app.cli.chatgpt import \
+  < ~/.config/x-ai-auto-post/chatgpt-credentials.json
+```
+
+セルフホスト VM の場合（SSH で転送し、以後は VM が refresh を管理します）:
+
+```bash
+ssh <vm> 'cd x-ai-auto-post && docker compose run --rm -T api python -m app.cli.chatgpt import' \
+  < ~/.config/x-ai-auto-post/chatgpt-credentials.json
+```
+
+- 取り込んだ後は、サーバーだけが refresh します。refresh token は使うたびに置き換わるため、
+  同じ credential を複数のホストで使わないでください。
+- PC 側のファイルには token が含まれます。再認証用に issued client ID の記録として残す場合は、
+  権限 `0600` のまま安全に保管してください。
+- 別の ChatGPT アカウントに切り替えるときは、`DELETE /auth/chatgpt` を実行してから取り込みます。
+
+### 3. 動作を確認する（smoke test）
+
+```bash
+docker compose run --rm api python -m app.cli.chatgpt smoke
+```
+
+接続アカウントで使えるモデル（`GET /v1/models` のうち `visibility: "list"` のもの）を表示します。
+`CHATGPT_MODEL` が含まれていれば、Responses API を1回呼び、`response.completed` まで受信できる
+ことを確認します。ChatGPT プランの利用枠を消費するため、CI では実行しません。
+
+### 再認証・切断
+
+- token が使えなくなったら、同じ PC で `login` を再実行してから `import` します。保存済みの
+  issued client ID が再利用されます。
+- `DELETE /auth/chatgpt` は、サーバーの token を消去します（client ID と host ID は残します）。
+  OpenAI 側での接続解除は、ChatGPT の Settings で行ってください。
+- PC 側で別のアカウントを新規登録するときは、`~/.config/x-ai-auto-post/chatgpt-credentials.json`
+  を削除してから `login` します。`host-id` は削除しないでください。
+
+### 旧版からの移行
+
+FastAPI の `/auth/chatgpt/login` を使っていた旧版からは、次の手順で移行します。
+
+1. `.env` から `CHATGPT_CLIENT_ID`・`CHATGPT_CLIENT_SECRET`・`CHATGPT_REDIRECT_URI`・
+   `CHATGPT_SCOPE`・`CHATGPT_RESOURCE`・`CHATGPT_AUTHORIZE_URL`・`CHATGPT_TOKEN_URL` を削除します
+   （残っていても無視されます）。
+2. `CHATGPT_HOST_ID` を上記の形式で設定します。形式が不正な場合、起動時にエラーになります。
+3. `alembic upgrade head` を実行します（Compose では `migrate` が自動で実行します）。
+4. 上記の手順で、Sign in と取り込みをやり直します。旧版で保存した ChatGPT credential は
+   「再認証が必要」と判定され、推論には使いません。
+
+`chatgpt_credentials` に identity 列を追加した migration より前へ `alembic downgrade` した場合も、
+ChatGPT の Sign in と取り込みをやり直してください。
+
 ## 接続と管理 API
 
-`/health` と OAuth callback 以外に `Authorization: ****** が必要です。
-login API が返す `authorization_url` をブラウザで開き、同意してください。
-callback は一回限りの state で検証します。X と ChatGPT の両方を接続してください。
+`/health` と X の OAuth callback 以外の API には、`Authorization: Bearer <ADMIN_API_TOKEN>` が
+必要です。X は、login API が返す `authorization_url` をブラウザで開いて同意します。callback は
+一回限りの state で検証します。ChatGPT は上記の CLI で接続します。X と ChatGPT の両方を接続して
+ください。
 
 | API | 用途 |
 | --- | --- |
 | `GET /health` | DB 接続の readiness |
-| `GET /auth/{chatgpt,x}/login` | PKCE 認可 URL を発行 |
-| `GET /auth/{chatgpt,x}/callback` | code 交換と暗号化保存 |
+| `GET /auth/x/login` | X の PKCE 認可 URL を発行 |
+| `GET /auth/x/callback` | X の code 交換と暗号化保存 |
 | `GET /auth/{chatgpt,x}/status` | token を含まない接続状態 |
-| `DELETE /auth/{chatgpt,x}` | ローカル Credential を削除 |
+| `DELETE /auth/{chatgpt,x}` | サーバーの token を削除（client ID・host ID は保持） |
 | `GET /sources`, `GET /articles` | 収集元・候補の確認 |
 | `POST /articles/collect` | RSS 収集のみ（AI 不使用） |
 | `GET /schedules`, `PUT /schedules` | 投稿時刻と timezone の変更 |

@@ -1,16 +1,17 @@
 # MacBookでのセットアップ・起動手順
 
-更新日: 2026-10-10 JST
+更新日: 2026-10-11 JST
 対象: [HARA-Akihiko/x-ai-auto-post](https://github.com/HARA-Akihiko/x-ai-auto-post)
 
 MacBook（Apple Silicon / Intel）で Docker Desktop と Docker Compose を使って起動する手順です。API と投稿 Worker は別プロセスです。**初回は API の動作確認、OAuth 接続を完了してから Worker を起動**し、意図しない X 投稿を防ぎます。
 
-> **利用条件:** ChatGPT Plus 契約だけでは Sign in with ChatGPT の token-sharing 利用資格は保証されません。OpenAI 側で登録済みの Client ID / Host ID と許可モデル、X 側の有効な OAuth アプリ・投稿権限・API 利用枠が必要です。利用資格を確認できない場合は Worker を起動しないでください。API Key への自動フォールバックはありません。
+> **利用条件:** ChatGPT は Sign in with ChatGPT の token sharing（オープンソースアプリ向け、preview）で接続します。OpenAI API Key や事前登録の Client ID は不要ですが、Sign in 時に ChatGPT プランの利用を許可する必要があります。Plus の5時間利用上限は他のアプリと共有されます。X 側では、有効な OAuth アプリ・投稿権限・API 利用枠が必要です。手順5の smoke test が成功するまで Worker を起動しないでください。API Key への自動フォールバックはありません。
 
 ## 1. 事前準備
 
 - [Docker Desktop for Mac](https://docs.docker.com/desktop/setup/install/mac-install/) をインストールし、起動する（Apple Silicon / Intel に対応する版）。
-- Git と Python 3 を使用できるようにする。Python 3 は秘密鍵生成にだけ必要で、コンテナ実行に `uv` のローカルインストールは不要。
+- Git と Python 3 を使用できるようにする。
+- [uv](https://docs.astral.sh/uv/getting-started/installation/) をインストールする（例: `brew install uv`）。ChatGPT の Sign in は MacBook 上のブラウザで行うため、CLI を MacBook で実行するのに使います。API と Worker はコンテナで動くため、それ以外の用途では不要です。
 
 ターミナルで確認:
 
@@ -19,6 +20,7 @@ git --version
 docker --version
 docker compose version
 python3 --version
+uv --version
 ```
 
 ## 2. ソースコードの取得
@@ -65,16 +67,13 @@ ADMIN_API_TOKEN=REPLACE_WITH_ADMIN_TOKEN
 
 | 設定 | 内容 |
 | --- | --- |
-| `CHATGPT_CLIENT_ID` | OpenAI に正式登録した Client ID |
-| `CHATGPT_HOST_ID` | 同じ登録に紐づく Host ID |
-| `CHATGPT_MODEL` | 接続アカウントで許可されたモデル |
-| `CHATGPT_CLIENT_SECRET` | 登録方式で必要な場合のみ |
+| `CHATGPT_HOST_ID` | このサーバー用の host ID。`python3 -c 'import uuid; print("urn:uuid:" + str(uuid.uuid4()))'` で一度だけ生成し、変更しない |
+| `CHATGPT_MODEL` | 接続アカウントで使えるモデル。手順5の smoke test が一覧を表示する |
 | `X_CLIENT_ID` | X Developer Portal の Client ID |
 | `X_CLIENT_SECRET` | X アプリのクライアント種別で必要な場合 |
-| `CHATGPT_REDIRECT_URI` | 既定 `http://localhost:8000/auth/chatgpt/callback` |
 | `X_REDIRECT_URI` | 既定 `http://localhost:8000/auth/x/callback` |
 
-リダイレクト URL はそれぞれのプロバイダに登録された値と完全一致させてください。他アプリの Codex Client ID を流用しないでください。
+X のリダイレクト URL は、X に登録した値と完全に一致させてください。ChatGPT の Client ID・Client Secret・リダイレクト URL は設定しません（Sign in 時に発行・決定されます）。他アプリの Codex Client ID を流用しないでください。
 
 ## 4. DB・マイグレーション・API の起動
 
@@ -103,18 +102,35 @@ API は MacBook 自身の `127.0.0.1:8000` のみに公開されます。Swagger
 
 ## 5. ChatGPT と X の OAuth 接続
 
+### ChatGPT（MacBook 上の CLI で Sign in → コンテナへ取り込み）
+
+MacBook で Sign in します。ブラウザが開くので、ChatGPT にサインインし、ChatGPT プランの利用を許可します。
+
+```bash
+uv sync --frozen
+uv run python -m app.cli.chatgpt login
+```
+
+- callback は `http://127.0.0.1:1455/auth/callback` です。ポート1455が使用中なら `--port <番号>` を付けます。
+- ChatGPT プランの利用を許可しなかった場合は、`--consent` を付けて再実行します。
+- 認証情報は `~/.config/x-ai-auto-post/chatgpt-credentials.json`（権限 `0600`）に保存されます。このファイルを共有・コミットしないでください。
+
+コンテナ内の DB へ取り込み、smoke test で接続を確認します。smoke test は ChatGPT プランの利用枠を消費します。
+
+```bash
+docker compose run --rm -T api python -m app.cli.chatgpt import \
+  < ~/.config/x-ai-auto-post/chatgpt-credentials.json
+docker compose run --rm api python -m app.cli.chatgpt smoke
+```
+
+smoke test は使えるモデルを表示します。`CHATGPT_MODEL` が一覧にない場合は、`.env` を修正して再実行します（稼働中の API には `docker compose up -d api` で反映します）。`OK: response.completed received` が表示されれば成功です。
+
+### X
+
 管理トークンをシェル変数として読み込みます（値を画面に出力しない）。
 
 ```bash
 ADMIN_TOKEN="$(sed -n 's/^ADMIN_API_TOKEN=//p' .env)"
-```
-
-ChatGPT の認証 URL を発行:
-
-```bash
-curl --fail-with-body -sS \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  http://127.0.0.1:8000/auth/chatgpt/login
 ```
 
 X の認証 URL を発行:
@@ -125,7 +141,7 @@ curl --fail-with-body -sS \
   http://127.0.0.1:8000/auth/x/login
 ```
 
-それぞれ返される `authorization_url` を **MacBook 上のブラウザ**で開き、接続を許可します。`state` は10分の有効期限付き・1回限りです。認証 URL やコールバック URL を第三者と共有しないでください。
+返される `authorization_url` を **MacBook 上のブラウザ**で開き、接続を許可します。`state` は10分の有効期限付き・1回限りです。認証 URL やコールバック URL を第三者と共有しないでください。
 
 接続状態の確認:
 
@@ -136,7 +152,7 @@ curl --fail-with-body -sS -H "Authorization: Bearer $ADMIN_TOKEN" \
   http://127.0.0.1:8000/auth/x/status
 ```
 
-**両方 `connected: true` を確認**してください。`expired: true` の場合、更新や再認証が必要になる場合があります。確認後は `unset ADMIN_TOKEN` で消去できます。
+**両方 `connected: true` を確認**してください。`expired: true` は、次回利用時に refresh されます。ChatGPT が `reauthorization_required: true` の場合は、`login` と `import` をやり直してください。確認後は `unset ADMIN_TOKEN` で消去できます。
 
 ## 6. 投稿 Worker の起動
 
@@ -186,8 +202,12 @@ MacBook がスリープ・シャットダウンした場合、Docker Worker は�
 | `/health` が503 | DBパスワード、接続 URL、マイグレーション |
 | ポート8000の競合 | `lsof -nP -iTCP:8000 -sTCP:LISTEN` |
 | 管理APIが401 | `ADMIN_API_TOKEN` と `Authorization: Bearer ...` |
-| `oauth_not_configured` | ChatGPT / X の Client ID、ChatGPT Host ID |
-| OAuthが失敗 | 登録済みredirect URI、許可scope、利用資格 |
+| `oauth_not_configured` | X の Client ID、`CHATGPT_HOST_ID`（import 時） |
+| `oauth_scope_missing`（ChatGPT の login） | `login --consent` で ChatGPT プランの利用を許可し直す |
+| `oauth_reauthorization_required` | ChatGPT の `login` と `import` をやり直す |
+| `127.0.0.1:1455 is not available` | `login --port <番号>` で別のポートを使う |
+| `subscription_sharing_*`（smoke test） | ChatGPT の Settings → Usage で利用枠・利用資格を確認 |
+| X の OAuth が失敗 | 登録済み redirect URI、許可 scope、利用資格 |
 | 自動投稿されない | Workerのログと管理API `GET /jobs/runs` の `error_code` |
 
 **二重投稿防止:** X への送信結果が通信障害で不明な場合、同じ投稿を自動で再POSTしない設計です。X の実際の投稿履歴を確認する前に手動再送しないでください。
@@ -201,7 +221,9 @@ MacBook がスリープ・シャットダウンした場合、Docker Worker は�
 - [app/main.py](../app/main.py)
 - [app/core/config.py](../app/core/config.py)
 - [app/services/auth.py](../app/services/auth.py)
+- [app/cli/chatgpt.py](../app/cli/chatgpt.py)
 - [app/scheduler/worker.py](../app/scheduler/worker.py)
 - [Docker Desktop（macOS）公式](https://docs.docker.com/desktop/setup/install/mac-install/)
-- [Sign in with ChatGPT](https://developers.openai.com/siwc)
+- [Sign in with ChatGPT – token sharing for open-source apps](https://developers.openai.com/siwc/token-sharing-open-source)
+- [uv のインストール](https://docs.astral.sh/uv/getting-started/installation/)
 - [X OAuth 2.0 / PKCE](https://docs.x.com/fundamentals/authentication/oauth-2-0/authorization-code)

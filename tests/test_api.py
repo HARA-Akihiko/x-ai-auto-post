@@ -79,6 +79,18 @@ def test_errors_and_oauth_status_never_expose_credentials():
         assert "secret" not in response.text
 
 
+def test_chatgpt_sign_in_is_not_served_by_api():
+    # ChatGPT sign-in requires a 127.0.0.1 loopback callback and runs in the local CLI.
+    client, _, headers = make_client()
+    with client:
+        assert client.get("/auth/chatgpt/login", headers=headers).status_code == 404
+        assert client.get("/auth/chatgpt/callback?state=s&code=c").status_code == 404
+        assert client.get("/auth/x/login", headers=headers).status_code == 400
+        assert client.get("/auth/chatgpt/status", headers=headers).json() == {
+            "provider": "chatgpt", "connected": False}
+        assert client.delete("/auth/chatgpt", headers=headers).status_code == 200
+
+
 def test_draft_publish_only_queues_and_missing_draft_is_rejected():
     client, factory, headers = make_client()
     with factory() as session:

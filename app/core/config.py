@@ -1,3 +1,4 @@
+import re
 from enum import StrEnum
 from functools import lru_cache
 from urllib.parse import urlsplit
@@ -6,6 +7,30 @@ from zoneinfo import ZoneInfo
 from cryptography.fernet import Fernet
 from pydantic import SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+# Fixed by Sign in with ChatGPT token sharing for open-source apps (checked 2026-10-11):
+# https://developers.openai.com/siwc/token-sharing-open-source/sign-in
+# https://auth.openai.com/.well-known/openid-configuration
+CHATGPT_ISSUER = "https://auth.openai.com"
+CHATGPT_AUTHORIZE_URL = "https://auth.openai.com/api/accounts/authorize"
+CHATGPT_TOKEN_URL = "https://auth.openai.com/api/accounts/oauth/token"
+CHATGPT_JWKS_URL = "https://auth.openai.com/.well-known/jwks.json"
+CHATGPT_RESOURCE = "https://api.openai.com/v1"
+CHATGPT_SCOPE = "openid profile email offline_access resource.invoke chatgpt.tokens.use.direct"
+CHATGPT_MODELS_URL = "https://api.openai.com/v1/models"
+
+MAX_HOST_ID_LENGTH = 255
+# Accepted ext_agent_host_id formats: UUID URN, RFC 9278 JWK thumbprint URI, did:key.
+HOST_ID_PATTERN = re.compile(
+    r"urn:uuid:[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    r"|urn:ietf:params:oauth:jwk-thumbprint:[A-Za-z0-9-]+:[A-Za-z0-9_-]+"
+    r"|did:key:z[1-9A-HJ-NP-Za-km-z]+"
+)
+
+
+def is_valid_host_id(value: str) -> bool:
+    return len(value) <= MAX_HOST_ID_LENGTH and HOST_ID_PATTERN.fullmatch(value) is not None
 
 
 class URLPolicy(StrEnum):
@@ -27,13 +52,7 @@ class Settings(BaseSettings):
     candidate_limit: int = 3
     article_max_age_days: int = 7
     web_search_enabled: bool = False
-    chatgpt_client_id: str = ""
-    chatgpt_client_secret: SecretStr = SecretStr("")
-    chatgpt_authorize_url: str = "https://auth.openai.com/oauth/authorize"
-    chatgpt_token_url: str = "https://auth.openai.com/oauth/token"
-    chatgpt_redirect_uri: str = "http://localhost:8000/auth/chatgpt/callback"
-    chatgpt_scope: str = "openid offline_access resource.invoke chatgpt.tokens.use.direct"
-    chatgpt_resource: str = "https://api.openai.com/v1"
+    # This server's own ext_agent_host_id; credentials imported from the CLI are bound to it.
     chatgpt_host_id: str = ""
     chatgpt_model: str = ""
     responses_url: str = "https://api.openai.com/v1/responses"
@@ -64,8 +83,14 @@ class Settings(BaseSettings):
         ZoneInfo(value)
         return value
 
-    @field_validator("chatgpt_authorize_url", "chatgpt_token_url", "chatgpt_resource", "responses_url",
-                     "x_authorize_url", "x_token_url", "x_api_url")
+    @field_validator("chatgpt_host_id")
+    @classmethod
+    def valid_host_id(cls, value: str) -> str:
+        if value and not is_valid_host_id(value):
+            raise ValueError("CHATGPT_HOST_ID must be a urn:uuid, JWK thumbprint URI or did:key")
+        return value
+
+    @field_validator("responses_url", "x_authorize_url", "x_token_url", "x_api_url")
     @classmethod
     def secure_endpoint(cls, value: str) -> str:
         parsed = urlsplit(value)
@@ -74,7 +99,7 @@ class Settings(BaseSettings):
             raise ValueError("OAuth and API endpoints must use HTTPS without URL credentials")
         return value
 
-    @field_validator("chatgpt_redirect_uri", "x_redirect_uri")
+    @field_validator("x_redirect_uri")
     @classmethod
     def secure_redirect(cls, value: str) -> str:
         parsed = urlsplit(value)

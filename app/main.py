@@ -100,13 +100,13 @@ def create_app(settings=None, session_factory=None, http_client=None) -> FastAPI
         return JSONResponse(status_code=503, content={"error_code": "database_error"})
 
     # The callback is authenticated by its one-use OAuth state, not an API bearer header.
-    @application.get("/auth/{provider}/callback")
-    async def callback(provider: str, state: str, code: str, request: Request):
-        check_provider(provider)
+    # Only X uses this browser flow; ChatGPT signs in through the local CLI (app/cli/chatgpt.py).
+    @application.get("/auth/x/callback")
+    async def callback(state: str, code: str, request: Request):
         from app.services.auth import ServiceError
 
         try:
-            await request.app.state.auth.callback(provider, state, code)
+            await request.app.state.auth.callback("x", state, code)
         except ServiceError as exc:
             return JSONResponse(status_code=400, content={"error_code": exc.error_code})
         return {"status": "connected"}
@@ -128,13 +128,12 @@ def create_app(settings=None, session_factory=None, http_client=None) -> FastAPI
         check_provider(provider)
         return request.app.state.auth.status(provider)
 
-    @application.get("/auth/{provider}/login", dependencies=protected)
-    def login(provider: str, request: Request):
-        check_provider(provider)
+    @application.get("/auth/x/login", dependencies=protected)
+    def login(request: Request):
         from app.services.auth import ServiceError
 
         try:
-            return {"authorization_url": request.app.state.auth.login(provider)}
+            return {"authorization_url": request.app.state.auth.login("x")}
         except ServiceError as exc:
             return JSONResponse(status_code=400, content={"error_code": exc.error_code})
 
